@@ -35,9 +35,27 @@ app.get("/", (req, res) => {
   res.send("BookNook server is running!");
 });
 
-app.get("/test", (req, res) => {
-  res.send({ msg: "BookNook API working!" });
+// app.get("/test", (req, res) => {
+//   res.send({ msg: "BookNook API working!" });
+// });
+
+// GET all books
+app.get("/books", async (req, res) => {
+  try {
+    const books = await booksCollection
+      .find()
+      .sort({ createdAt: -1 })
+      .toArray();
+
+    res.send(books);
+  } catch (error) {
+    console.error("Failed to fetch books:", error);
+    res.status(500).send({ message: "Failed to fetch books" });
+  }
 });
+
+
+
 
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
