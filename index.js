@@ -1,14 +1,14 @@
 import express from "express";
 import cors from "cors";
 import { MongoClient } from "mongodb";
-import "dotenv/config";
+import "dotenv/config";   
 
-const PORT = 5000;
+const PORT = 5000;   
 
-const app = express();
+const app = express();   
 
-app.use(cors());
-app.use(express.json());
+app.use(cors());    
+app.use(express.json());   
 
 const client = new MongoClient(process.env.MONGO_URI);
 
@@ -25,7 +25,7 @@ async function connectToMongoDB() {
 }
 
 // Connect database
-const db = await connectToMongoDB();
+const db = await connectToMongoDB(); 
 
 // Create collections
 const booksCollection = db.collection("books");
