@@ -4,12 +4,12 @@ import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 
 const PORT = 5000;
-const FRONTEND_URL = process.env.FRONTEND_URL?.replace(/\/$/, "");
+const FRONTEND_URL = process.env.FRONTEND_URL?.replace(/\/$/, "");  
 
-const app = express();
-
+const app = express();        
+   
 app.use(
-  cors({
+  cors({      
     origin: FRONTEND_URL,
     credentials: true,
   }),
