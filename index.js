@@ -1,61 +1,82 @@
+
 import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
+import multer from "multer";
 
 const PORT = 5000;
-const FRONTEND_URL = process.env.FRONTEND_URL?.replace(/\/$/, "");  
+const FRONTEND_URL = process.env.FRONTEND_URL;
 
-const app = express();        
-   
-app.use(
-  cors({      
-    origin: FRONTEND_URL,
-    credentials: true,
-  }),
-);
+const app = express();
 
+app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json());
 
-// MongoDB connection
-const client = new MongoClient(process.env.MONGO_URI);
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype.startsWith("image/")) cb(null, true);
+    else cb(new Error("Only image files are allowed"));
+  },
+});
 
+const client = new MongoClient(process.env.MONGO_URI);
 await client.connect();
 
 console.log("MongoDB connected successfully!");
 
 const db = client.db("book-nook");
-
 const booksCollection = db.collection("books");
 const borrowsCollection = db.collection("borrows");
 
-// Reusable Better Auth session verification
+// Verify Better Auth session
 const getLoggedInUser = async (req) => {
   try {
     const cookie = req.headers.cookie;
+    if (!cookie || !FRONTEND_URL) return null;
 
-    if (!cookie || !FRONTEND_URL) {
-      return null;
-    }
+    const response = await fetch(
+      `${FRONTEND_URL}/api/auth/get-session`,
+      { headers: { cookie } },
+    );
 
-    const response = await fetch(`${FRONTEND_URL}/api/auth/get-session`, {
-      headers: {
-        cookie,
-      },
-    });
+    if (!response.ok) return null;
 
-    if (!response.ok) {
-      return null;
-    }
-
-    const sessionData = await response.json();
-
-    return sessionData?.user?.email ? sessionData.user : null;
+    const data = await response.json();
+    return data?.user?.email ? data.user : null;
   } catch (error) {
-    console.error("Session verification error:", error);
+    console.error("Session error:", error);
     return null;
   }
 };
+
+// Upload image to ImgBB
+const uploadImage = async (file) => {
+  if (!file) return null;
+  if (!process.env.IMGBB_API_KEY) {
+    throw new Error("ImgBB API key is missing");
+  }
+
+  const formData = new FormData();
+  formData.append("image", file.buffer.toString("base64"));
+
+  const response = await fetch(
+    `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
+    { method: "POST", body: formData },
+  );
+
+  const data = await response.json();
+
+  if (!response.ok || !data.success) {
+    throw new Error("Image upload failed");
+  }
+
+  return data.data.display_url;
+};
+
+// Home
 app.get("/", (req, res) => {
   res.send("BookNook server is running!");
 });
@@ -63,11 +84,7 @@ app.get("/", (req, res) => {
 // Get all books
 app.get("/books", async (req, res) => {
   try {
-    const books = await booksCollection
-      .find()
-      .sort({ createdAt: -1 })
-      .toArray();
-
+    const books = await booksCollection.find().sort({ createdAt: -1 }).toArray();
     res.send(books);
   } catch (error) {
     console.error(error);
@@ -78,20 +95,15 @@ app.get("/books", async (req, res) => {
 // Get single book
 app.get("/books/:id", async (req, res) => {
   try {
-    const { id } = req.params;
-
-    if (!ObjectId.isValid(id)) {
+    if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).send({ message: "Invalid book ID" });
     }
 
     const book = await booksCollection.findOne({
-      _id: new ObjectId(id),
+      _id: new ObjectId(req.params.id),
     });
 
-    if (!book) {
-      return res.status(404).send({ message: "Book not found" });
-    }
-
+    if (!book) return res.status(404).send({ message: "Book not found" });
     res.send(book);
   } catch (error) {
     console.error(error);
@@ -99,76 +111,43 @@ app.get("/books/:id", async (req, res) => {
   }
 });
 
-// Add a new book
-app.post("/add-book", async (req, res) => {
+// Add book
+app.post("/add-book", upload.single("image"), async (req, res) => {
   try {
     const user = await getLoggedInUser(req);
-
-    if (!user) {
-      return res.status(401).send({
-        message: "Please login first",
-      });
+    if (!user) return res.status(401).send({ message: "Please login first" });
+    if (!req.file) {
+      return res.status(400).send({ message: "Please select a book image" });
     }
 
-    const {
-      title,
-      author,
-      category,
-      imageUrl,
-      rating,
-      totalCopies,
-      description,
-    } = req.body;
+    const { title, author, category, rating, totalCopies, description } = req.body;
 
     if (
-      typeof title !== "string" ||
-      title.trim().length < 2 ||
-      typeof author !== "string" ||
-      !author.trim() ||
-      typeof category !== "string" ||
-      !category.trim() ||
-      typeof imageUrl !== "string" ||
-      !imageUrl.trim() ||
-      typeof description !== "string" ||
-      description.trim().length < 10
+      !title?.trim() || title.trim().length < 2 ||
+      !author?.trim() || !category?.trim() ||
+      !description?.trim() || description.trim().length < 10 ||
+      !Number.isInteger(Number(totalCopies)) || Number(totalCopies) < 1 ||
+      !Number.isFinite(Number(rating)) || Number(rating) < 0 || Number(rating) > 5
     ) {
-      return res.status(400).send({
-        message: "Please provide valid book information",
-      });
+      return res.status(400).send({ message: "Please provide valid book information" });
     }
 
-    if (
-      !Number.isInteger(Number(totalCopies)) ||
-      Number(totalCopies) < 1 ||
-      !Number.isFinite(Number(rating)) ||
-      Number(rating) < 0 ||
-      Number(rating) > 5
-    ) {
-      return res.status(400).send({
-        message: "Please provide valid rating and copy information",
-      });
-    }
-
+    const imageUrl = await uploadImage(req.file);
     const copies = Number(totalCopies);
 
-    const bookData = {
+    const result = await booksCollection.insertOne({
       title: title.trim(),
       author: author.trim(),
       category: category.trim(),
-      imageUrl: imageUrl.trim(),
+      imageUrl,
       rating: Number(rating),
       totalCopies: copies,
       availableCopies: copies,
       description: description.trim(),
-
-      // User information comes from verified Better Auth session
       addedByName: user.name || "",
       addedByEmail: user.email.trim().toLowerCase(),
-
       createdAt: new Date(),
-    };
-
-    const result = await booksCollection.insertOne(bookData);
+    });
 
     res.status(201).send({
       success: true,
@@ -176,101 +155,276 @@ app.post("/add-book", async (req, res) => {
       insertedId: result.insertedId,
     });
   } catch (error) {
-    console.error("Add book error:", error);
-
-    res.status(500).send({
-      message: "Failed to add book",
-    });
+    console.error(error);
+    res.status(500).send({ message: error.message || "Failed to add book" });
   }
 });
 
-// Borrow a book
+// Borrow book
 app.post("/borrow/:id", async (req, res) => {
   try {
-    const { id } = req.params;
+    const user = await getLoggedInUser(req);
+    if (!user) return res.status(401).send({ message: "Please login first" });
 
+    const { id } = req.params;
     if (!ObjectId.isValid(id)) {
       return res.status(400).send({ message: "Invalid book ID" });
     }
 
-    // Verify logged-in user
-    const user = await getLoggedInUser(req);
-
-    if (!user) {
-      return res.status(401).send({
-        message: "Please login first",
-      });
-    }
-
     const bookId = new ObjectId(id);
     const email = user.email.trim().toLowerCase();
-
     const book = await booksCollection.findOne({ _id: bookId });
 
-    if (!book) {
-      return res.status(404).send({ message: "Book not found" });
-    }
+    if (!book) return res.status(404).send({ message: "Book not found" });
 
-    const existingBorrow = await borrowsCollection.findOne({
-      bookId,
-      borrowerEmail: email,
-      status: "borrowed",
+    const existing = await borrowsCollection.findOne({
+      bookId, borrowerEmail: email, status: "borrowed",
     });
 
-    if (existingBorrow) {
-      return res.status(409).send({
-        message: "You have already borrowed this book",
-      });
+    if (existing) {
+      return res.status(409).send({ message: "You have already borrowed this book" });
     }
 
-    const updateResult = await booksCollection.updateOne(
-      {
-        _id: bookId,
-        availableCopies: { $gt: 0 },
-      },
-      {
-        $inc: { availableCopies: -1 },
-      },
+    const update = await booksCollection.updateOne(
+      { _id: bookId, availableCopies: { $gt: 0 } },
+      { $inc: { availableCopies: -1 } },
     );
 
-    if (updateResult.modifiedCount === 0) {
-      return res.status(409).send({
-        message: "This book is currently unavailable",
-      });
+    if (!update.modifiedCount) {
+      return res.status(409).send({ message: "This book is unavailable" });
     }
+
+    const borrowDate = new Date();
+    const returnDate = new Date(borrowDate.getTime() + 5 * 86400000);
 
     try {
       await borrowsCollection.insertOne({
         bookId,
         bookTitle: book.title,
+        bookImage: book.imageUrl,
         borrowerName: user.name || "",
         borrowerEmail: email,
-        borrowedAt: new Date(),
+        borrowDate,
+        returnDate,
         status: "borrowed",
+        returnedAt: null,
       });
     } catch (error) {
       await booksCollection.updateOne(
         { _id: bookId },
         { $inc: { availableCopies: 1 } },
       );
-
       throw error;
     }
 
-    res.send({
-      success: true,
-      message: "Book borrowed successfully!",
-    });
+    res.send({ success: true, message: "Book borrowed successfully!" });
   } catch (error) {
-    console.error("Failed to borrow book:", error);
-
-    res.status(500).send({
-      message: "Failed to borrow book",
-    });
+    console.error(error);
+    res.status(500).send({ message: "Failed to borrow book" });
   }
 });
 
-// Start server
+// Get my books
+app.get("/my-books", async (req, res) => {
+  try {
+    const user = await getLoggedInUser(req);
+    if (!user) return res.status(401).send({ message: "Please login first" });
+
+    const books = await booksCollection.find({
+      addedByEmail: user.email.trim().toLowerCase(),
+    }).sort({ createdAt: -1 }).toArray();
+
+    res.send(books);
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to fetch your books" });
+  }
+});
+
+// Edit my book
+app.patch("/books/:id", upload.single("image"), async (req, res) => {
+  try {
+    const user = await getLoggedInUser(req);
+    if (!user) return res.status(401).send({ message: "Please login first" });
+
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid book ID" });
+    }
+
+    const filter = {
+      _id: new ObjectId(id),
+      addedByEmail: user.email.trim().toLowerCase(),
+    };
+
+    const book = await booksCollection.findOne(filter);
+    if (!book) return res.status(404).send({ message: "Book not found" });
+
+    const { title, author, category, rating, totalCopies, description } = req.body;
+
+    if (
+      !title?.trim() || !author?.trim() || !category?.trim() ||
+      !description?.trim() ||
+      !Number.isFinite(Number(rating)) || Number(rating) < 0 || Number(rating) > 5 ||
+      !Number.isInteger(Number(totalCopies)) || Number(totalCopies) < 1
+    ) {
+      return res.status(400).send({ message: "Invalid book information" });
+    }
+
+    const copies = Number(totalCopies);
+    const borrowedCopies = book.totalCopies - book.availableCopies;
+
+    if (copies < borrowedCopies) {
+      return res.status(400).send({
+        message: `At least ${borrowedCopies} copies are currently borrowed`,
+      });
+    }
+
+    const imageUrl = (await uploadImage(req.file)) || book.imageUrl;
+
+    await booksCollection.updateOne(filter, {
+      $set: {
+        title: title.trim(),
+        author: author.trim(),
+        category: category.trim(),
+        description: description.trim(),
+        rating: Number(rating),
+        totalCopies: copies,
+        availableCopies: copies - borrowedCopies,
+        imageUrl,
+      },
+    });
+
+    res.send({ success: true, message: "Book updated successfully!" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: error.message || "Failed to update book" });
+  }
+});
+
+// Delete my book
+app.delete("/books/:id", async (req, res) => {
+  try {
+    const user = await getLoggedInUser(req);
+    if (!user) return res.status(401).send({ message: "Please login first" });
+
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid book ID" });
+    }
+
+    const bookId = new ObjectId(id);
+    const email = user.email.trim().toLowerCase();
+
+    const activeBorrow = await borrowsCollection.findOne({
+      bookId, status: "borrowed",
+    });
+
+    if (activeBorrow) {
+      return res.status(409).send({
+        message: "Cannot delete a book while it is borrowed",
+      });
+    }
+
+    const result = await booksCollection.deleteOne({
+      _id: bookId, addedByEmail: email,
+    });
+
+    if (!result.deletedCount) {
+      return res.status(404).send({ message: "Book not found" });
+    }
+
+    res.send({ success: true, message: "Book deleted successfully!" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to delete book" });
+  }
+});
+
+// Get my borrows
+app.get("/my-borrows", async (req, res) => {
+  try {
+    const user = await getLoggedInUser(req);
+    if (!user) return res.status(401).send({ message: "Please login first" });
+
+    const borrows = await borrowsCollection.find({
+      borrowerEmail: user.email.trim().toLowerCase(),
+    }).sort({ borrowDate: -1 }).toArray();
+
+    const now = new Date();
+
+    res.send(borrows.map((borrow) => {
+      const borrowDate = borrow.borrowDate || borrow.borrowedAt;
+      const returnDate = borrow.returnDate ||
+        (borrowDate ? new Date(new Date(borrowDate).getTime() + 5 * 86400000) : null);
+
+      return {
+        ...borrow,
+        borrowDate,
+        returnDate,
+        overdue: borrow.status === "borrowed" &&
+          returnDate && new Date(returnDate) < now,
+      };
+    }));
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to fetch borrow records" });
+  }
+});
+
+// Return book
+app.patch("/return/:id", async (req, res) => {
+  try {
+    const user = await getLoggedInUser(req);
+    if (!user) return res.status(401).send({ message: "Please login first" });
+
+    const { id } = req.params;
+    if (!ObjectId.isValid(id)) {
+      return res.status(400).send({ message: "Invalid borrow ID" });
+    }
+
+    const email = user.email.trim().toLowerCase();
+
+    const borrow = await borrowsCollection.findOneAndUpdate(
+      {
+        _id: new ObjectId(id),
+        borrowerEmail: email,
+        status: "borrowed",
+      },
+      { $set: { status: "returned", returnedAt: new Date() } },
+      { returnDocument: "after" },
+    );
+
+    if (!borrow) {
+      return res.status(404).send({ message: "Active borrow record not found" });
+    }
+
+    const bookUpdate = await booksCollection.updateOne(
+      { _id: borrow.bookId },
+      { $inc: { availableCopies: 1 } },
+    );
+
+    if (!bookUpdate.matchedCount) {
+      console.error("Returned borrow has no matching book:", borrow.bookId);
+    }
+
+    res.send({ success: true, message: "Book returned successfully!" });
+  } catch (error) {
+    console.error(error);
+    res.status(500).send({ message: "Failed to return book" });
+  }
+});
+
+// Multer errors
+app.use((error, req, res, next) => {
+  if (error instanceof multer.MulterError || error) {
+    return res.status(400).send({
+      message: error.message || "Something went wrong",
+    });
+  }
+  next();
+});
+
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
