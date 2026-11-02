@@ -326,11 +326,11 @@ app.delete("/books/:id", async (req, res) => {
       });
     }
 
-    const result = await booksCollection.deleteOne({
+    const result = await booksCollection.deleteOne({    
       _id: bookId, addedByEmail: email,
     });
 
-    if (!result.deletedCount) {
+    if (!result.deletedCount) {    
       return res.status(404).send({ message: "Book not found" });
     }
 
