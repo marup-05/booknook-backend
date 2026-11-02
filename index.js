@@ -1,35 +1,61 @@
-
 import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 
 const PORT = 5000;
+const FRONTEND_URL = process.env.FRONTEND_URL?.replace(/\/$/, "");
+
 const app = express();
 
-app.use(cors());
+app.use(
+  cors({
+    origin: FRONTEND_URL,
+    credentials: true,
+  }),
+);
+
 app.use(express.json());
 
+// MongoDB connection
 const client = new MongoClient(process.env.MONGO_URI);
 
-async function connectToMongoDB() {
-  try {
-    await client.connect();
-    console.log("MongoDB connected successfully!");
+await client.connect();
 
-    return client.db("book-nook");
-  } catch (error) {
-    console.error("MongoDB connection failed:", error);
-    process.exit(1);
-  }
-}
+console.log("MongoDB connected successfully!");
 
-const db = await connectToMongoDB();
+const db = client.db("book-nook");
 
 const booksCollection = db.collection("books");
 const borrowsCollection = db.collection("borrows");
 
-// Home route
+// Reusable Better Auth session verification
+const getLoggedInUser = async (req) => {
+  try {
+    const cookie = req.headers.cookie;
+
+    if (!cookie || !FRONTEND_URL) {
+      return null;
+    }
+
+    const response = await fetch(`${FRONTEND_URL}/api/auth/get-session`, {
+      headers: {
+        cookie,
+      },
+    });
+
+    if (!response.ok) {
+      return null;
+    }
+
+    const sessionData = await response.json();
+
+    return sessionData?.user?.email ? sessionData.user : null;
+  } catch (error) {
+    console.error("Session verification error:", error);
+    return null;
+  }
+};
 app.get("/", (req, res) => {
   res.send("BookNook server is running!");
 });
@@ -44,20 +70,18 @@ app.get("/books", async (req, res) => {
 
     res.send(books);
   } catch (error) {
-    console.error("Failed to fetch books:", error);
+    console.error(error);
     res.status(500).send({ message: "Failed to fetch books" });
   }
 });
 
-// Get single book details
+// Get single book
 app.get("/books/:id", async (req, res) => {
   try {
     const { id } = req.params;
 
     if (!ObjectId.isValid(id)) {
-      return res.status(400).send({
-        message: "Invalid book ID",
-      });
+      return res.status(400).send({ message: "Invalid book ID" });
     }
 
     const book = await booksCollection.findOne({
@@ -65,34 +89,98 @@ app.get("/books/:id", async (req, res) => {
     });
 
     if (!book) {
-      return res.status(404).send({
-        message: "Book not found",
-      });
+      return res.status(404).send({ message: "Book not found" });
     }
 
     res.send(book);
   } catch (error) {
-    console.error("Failed to fetch book details:", error);
-    res.status(500).send({
-      message: "Failed to fetch book details",
-    });
+    console.error(error);
+    res.status(500).send({ message: "Failed to fetch book details" });
   }
 });
 
 // Add a new book
 app.post("/add-book", async (req, res) => {
   try {
-    const data = req.body;
+    const user = await getLoggedInUser(req);
 
-    const result = await booksCollection.insertOne({
-      ...data,
+    if (!user) {
+      return res.status(401).send({
+        message: "Please login first",
+      });
+    }
+
+    const {
+      title,
+      author,
+      category,
+      imageUrl,
+      rating,
+      totalCopies,
+      description,
+    } = req.body;
+
+    if (
+      typeof title !== "string" ||
+      title.trim().length < 2 ||
+      typeof author !== "string" ||
+      !author.trim() ||
+      typeof category !== "string" ||
+      !category.trim() ||
+      typeof imageUrl !== "string" ||
+      !imageUrl.trim() ||
+      typeof description !== "string" ||
+      description.trim().length < 10
+    ) {
+      return res.status(400).send({
+        message: "Please provide valid book information",
+      });
+    }
+
+    if (
+      !Number.isInteger(Number(totalCopies)) ||
+      Number(totalCopies) < 1 ||
+      !Number.isFinite(Number(rating)) ||
+      Number(rating) < 0 ||
+      Number(rating) > 5
+    ) {
+      return res.status(400).send({
+        message: "Please provide valid rating and copy information",
+      });
+    }
+
+    const copies = Number(totalCopies);
+
+    const bookData = {
+      title: title.trim(),
+      author: author.trim(),
+      category: category.trim(),
+      imageUrl: imageUrl.trim(),
+      rating: Number(rating),
+      totalCopies: copies,
+      availableCopies: copies,
+      description: description.trim(),
+
+      // User information comes from verified Better Auth session
+      addedByName: user.name || "",
+      addedByEmail: user.email.trim().toLowerCase(),
+
       createdAt: new Date(),
-    });
+    };
 
-    res.send(result);
+    const result = await booksCollection.insertOne(bookData);
+
+    res.status(201).send({
+      success: true,
+      message: "Book added successfully!",
+      insertedId: result.insertedId,
+    });
   } catch (error) {
-    console.error("Failed to add book:", error);
-    res.status(500).send({ message: "Failed to add book" });
+    console.error("Add book error:", error);
+
+    res.status(500).send({
+      message: "Failed to add book",
+    });
   }
 });
 
@@ -100,34 +188,27 @@ app.post("/add-book", async (req, res) => {
 app.post("/borrow/:id", async (req, res) => {
   try {
     const { id } = req.params;
-    const { borrowerName, borrowerEmail } = req.body;
 
     if (!ObjectId.isValid(id)) {
-      return res.status(400).send({
-        message: "Invalid book ID",
-      });
+      return res.status(400).send({ message: "Invalid book ID" });
     }
 
-    if (
-      !borrowerName?.trim() ||
-      !borrowerEmail?.trim()
-    ) {
-      return res.status(400).send({
-        message: "Borrower name and email are required",
+    // Verify logged-in user
+    const user = await getLoggedInUser(req);
+
+    if (!user) {
+      return res.status(401).send({
+        message: "Please login first",
       });
     }
 
     const bookId = new ObjectId(id);
-    const email = borrowerEmail.trim().toLowerCase();
+    const email = user.email.trim().toLowerCase();
 
-    const book = await booksCollection.findOne({
-      _id: bookId,
-    });
+    const book = await booksCollection.findOne({ _id: bookId });
 
     if (!book) {
-      return res.status(404).send({
-        message: "Book not found",
-      });
+      return res.status(404).send({ message: "Book not found" });
     }
 
     const existingBorrow = await borrowsCollection.findOne({
@@ -149,7 +230,7 @@ app.post("/borrow/:id", async (req, res) => {
       },
       {
         $inc: { availableCopies: -1 },
-      }
+      },
     );
 
     if (updateResult.modifiedCount === 0) {
@@ -157,20 +238,20 @@ app.post("/borrow/:id", async (req, res) => {
         message: "This book is currently unavailable",
       });
     }
+
     try {
       await borrowsCollection.insertOne({
         bookId,
         bookTitle: book.title,
-        borrowerName: borrowerName.trim(),
+        borrowerName: user.name || "",
         borrowerEmail: email,
         borrowedAt: new Date(),
         status: "borrowed",
       });
     } catch (error) {
-      // Restore available copies if saving fails
       await booksCollection.updateOne(
         { _id: bookId },
-        { $inc: { availableCopies: 1 } }
+        { $inc: { availableCopies: 1 } },
       );
 
       throw error;
@@ -189,6 +270,7 @@ app.post("/borrow/:id", async (req, res) => {
   }
 });
 
+// Start server
 app.listen(PORT, () => {
   console.log(`Server is running on port ${PORT}`);
 });
