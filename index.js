@@ -506,19 +506,19 @@ app.patch("/return/:id", verifyToken, async (req, res) => {
     });
   } catch (error) {
     console.error("Return error:", error);
-    res.status(500).send({ message: "Failed to return book" });
+    res.status(500).send({ message: "Failed to return book" });   
   }
 });
 
-app.use((error, req, res, next) => {
+app.use((error, req, res, next) => {        
   console.error(error);
   res.status(400).send({
-    message: error.message || "Something went wrong",
+    message: error.message || "Something went wrong",        
   });
-});
+});         
 
-app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+app.listen(PORT, () => {             
+  console.log(`Server is running on port ${PORT}`);            
 });
 
 export default app;
