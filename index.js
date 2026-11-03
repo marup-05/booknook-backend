@@ -1,25 +1,45 @@
-
 import express from "express";
 import cors from "cors";
 import { MongoClient, ObjectId } from "mongodb";
 import "dotenv/config";
 import multer from "multer";
+import { createRemoteJWKSet, jwtVerify } from "jose";
 
 const PORT = 5000;
 const FRONTEND_URL = process.env.FRONTEND_URL;
-
 const app = express();
 
 app.use(cors({ origin: FRONTEND_URL, credentials: true }));
 app.use(express.json());
 
+const JWKS = createRemoteJWKSet(
+  new URL(`${FRONTEND_URL}/api/auth/jwks`)
+);
+
+const verifyToken = async (req, res, next) => {
+  const token = req.headers.authorization?.split(" ")[1];
+
+  if (!req.headers.authorization?.startsWith("Bearer ") || !token) {
+    return res.status(401).send({ message: "Unauthorized! Token required." });
+  }
+
+  try {
+    const { payload } = await jwtVerify(token, JWKS);
+    req.user = payload;
+    next();
+  } catch (error) {
+    console.error("Token verification failed:", error.message);
+    res.status(401).send({ message: "Invalid or expired token!" });
+  }
+};
+
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 5 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    if (file.mimetype.startsWith("image/")) cb(null, true);
-    else cb(new Error("Only image files are allowed"));
-  },
+  fileFilter: (req, file, cb) =>
+    file.mimetype.startsWith("image/")
+      ? cb(null, true)
+      : cb(new Error("Only image files are allowed")),
 });
 
 const client = new MongoClient(process.env.MONGO_URI);
@@ -31,16 +51,14 @@ const db = client.db("book-nook");
 const booksCollection = db.collection("books");
 const borrowsCollection = db.collection("borrows");
 
-// Verify Better Auth session
 const getLoggedInUser = async (req) => {
   try {
     const cookie = req.headers.cookie;
-    if (!cookie || !FRONTEND_URL) return null;
+    if (!cookie) return null;
 
-    const response = await fetch(
-      `${FRONTEND_URL}/api/auth/get-session`,
-      { headers: { cookie } },
-    );
+    const response = await fetch(`${FRONTEND_URL}/api/auth/get-session`, {
+      headers: { cookie },
+    });
 
     if (!response.ok) return null;
 
@@ -52,31 +70,26 @@ const getLoggedInUser = async (req) => {
   }
 };
 
-// Upload image to ImgBB
 const uploadImage = async (file) => {
   if (!file) return null;
-  if (!process.env.IMGBB_API_KEY) {
-    throw new Error("ImgBB API key is missing");
-  }
+  if (!process.env.IMGBB_API_KEY) throw new Error("ImgBB API key is missing");
 
   const formData = new FormData();
   formData.append("image", file.buffer.toString("base64"));
 
   const response = await fetch(
     `https://api.imgbb.com/1/upload?key=${process.env.IMGBB_API_KEY}`,
-    { method: "POST", body: formData },
+    { method: "POST", body: formData }
   );
 
   const data = await response.json();
-
-  if (!response.ok || !data.success) {
-    throw new Error("Image upload failed");
-  }
+  if (!response.ok || !data.success) throw new Error("Image upload failed");
 
   return data.data.display_url;
 };
 
-// Home
+const getEmail = (user) => user?.email?.trim().toLowerCase();
+
 app.get("/", (req, res) => {
   res.send("BookNook server is running!");
 });
@@ -93,7 +106,7 @@ app.get("/books", async (req, res) => {
 });
 
 // Get single book
-app.get("/books/:id", async (req, res) => {
+app.get("/books/:id", verifyToken, async (req, res) => {
   try {
     if (!ObjectId.isValid(req.params.id)) {
       return res.status(400).send({ message: "Invalid book ID" });
@@ -112,13 +125,13 @@ app.get("/books/:id", async (req, res) => {
 });
 
 // Add book
-app.post("/add-book", upload.single("image"), async (req, res) => {
+app.post("/add-book", verifyToken, upload.single("image"), async (req, res) => {
   try {
-    const user = await getLoggedInUser(req);
-    if (!user) return res.status(401).send({ message: "Please login first" });
-    if (!req.file) {
-      return res.status(400).send({ message: "Please select a book image" });
-    }
+    const user = req.user;
+    const email = getEmail(user);
+
+    if (!email) return res.status(401).send({ message: "User email not found in token" });
+    if (!req.file) return res.status(400).send({ message: "Please select a book image" });
 
     const { title, author, category, rating, totalCopies, description } = req.body;
 
@@ -145,7 +158,7 @@ app.post("/add-book", upload.single("image"), async (req, res) => {
       availableCopies: copies,
       description: description.trim(),
       addedByName: user.name || "",
-      addedByEmail: user.email.trim().toLowerCase(),
+      addedByEmail: email,
       createdAt: new Date(),
     });
 
@@ -167,12 +180,10 @@ app.post("/borrow/:id", async (req, res) => {
     if (!user) return res.status(401).send({ message: "Please login first" });
 
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid book ID" });
-    }
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid book ID" });
 
     const bookId = new ObjectId(id);
-    const email = user.email.trim().toLowerCase();
+    const email = getEmail(user);
     const book = await booksCollection.findOne({ _id: bookId });
 
     if (!book) return res.status(404).send({ message: "Book not found" });
@@ -187,7 +198,7 @@ app.post("/borrow/:id", async (req, res) => {
 
     const update = await booksCollection.updateOne(
       { _id: bookId, availableCopies: { $gt: 0 } },
-      { $inc: { availableCopies: -1 } },
+      { $inc: { availableCopies: -1 } }
     );
 
     if (!update.modifiedCount) {
@@ -212,7 +223,7 @@ app.post("/borrow/:id", async (req, res) => {
     } catch (error) {
       await booksCollection.updateOne(
         { _id: bookId },
-        { $inc: { availableCopies: 1 } },
+        { $inc: { availableCopies: 1 } }
       );
       throw error;
     }
@@ -225,14 +236,13 @@ app.post("/borrow/:id", async (req, res) => {
 });
 
 // Get my books
-app.get("/my-books", async (req, res) => {
+app.get("/my-books", verifyToken, async (req, res) => {
   try {
-    const user = await getLoggedInUser(req);
-    if (!user) return res.status(401).send({ message: "Please login first" });
+    const email = getEmail(req.user);
+    if (!email) return res.status(401).send({ message: "User email not found in token" });
 
-    const books = await booksCollection.find({
-      addedByEmail: user.email.trim().toLowerCase(),
-    }).sort({ createdAt: -1 }).toArray();
+    const books = await booksCollection.find({ addedByEmail: email })
+      .sort({ createdAt: -1 }).toArray();
 
     res.send(books);
   } catch (error) {
@@ -242,22 +252,17 @@ app.get("/my-books", async (req, res) => {
 });
 
 // Edit my book
-app.patch("/books/:id", upload.single("image"), async (req, res) => {
+app.patch("/books/:id", verifyToken, upload.single("image"), async (req, res) => {
   try {
-    const user = await getLoggedInUser(req);
-    if (!user) return res.status(401).send({ message: "Please login first" });
+    const email = getEmail(req.user);
+    if (!email) return res.status(401).send({ message: "User email not found in token" });
 
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid book ID" });
-    }
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid book ID" });
 
-    const filter = {
-      _id: new ObjectId(id),
-      addedByEmail: user.email.trim().toLowerCase(),
-    };
-
+    const filter = { _id: new ObjectId(id), addedByEmail: email };
     const book = await booksCollection.findOne(filter);
+
     if (!book) return res.status(404).send({ message: "Book not found" });
 
     const { title, author, category, rating, totalCopies, description } = req.body;
@@ -303,18 +308,19 @@ app.patch("/books/:id", upload.single("image"), async (req, res) => {
 });
 
 // Delete my book
-app.delete("/books/:id", async (req, res) => {
+app.delete("/books/:id", verifyToken, async (req, res) => {
   try {
-    const user = await getLoggedInUser(req);
-    if (!user) return res.status(401).send({ message: "Please login first" });
+    const email = getEmail(req.user);
+    if (!email) return res.status(401).send({ message: "User email not found in token" });
 
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid book ID" });
-    }
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid book ID" });
 
     const bookId = new ObjectId(id);
-    const email = user.email.trim().toLowerCase();
+    const filter = { _id: bookId, addedByEmail: email };
+    const book = await booksCollection.findOne(filter);
+
+    if (!book) return res.status(404).send({ message: "Book not found" });
 
     const activeBorrow = await borrowsCollection.findOne({
       bookId, status: "borrowed",
@@ -326,13 +332,8 @@ app.delete("/books/:id", async (req, res) => {
       });
     }
 
-    const result = await booksCollection.deleteOne({    
-      _id: bookId, addedByEmail: email,
-    });
-
-    if (!result.deletedCount) {    
-      return res.status(404).send({ message: "Book not found" });
-    }
+    const result = await booksCollection.deleteOne(filter);
+    if (!result.deletedCount) return res.status(404).send({ message: "Book not found" });
 
     res.send({ success: true, message: "Book deleted successfully!" });
   } catch (error) {
@@ -342,14 +343,13 @@ app.delete("/books/:id", async (req, res) => {
 });
 
 // Get my borrows
-app.get("/my-borrows", async (req, res) => {
+app.get("/my-borrows", verifyToken, async (req, res) => {
   try {
-    const user = await getLoggedInUser(req);
-    if (!user) return res.status(401).send({ message: "Please login first" });
+    const email = getEmail(req.user);
+    if (!email) return res.status(401).send({ message: "User email not found in token" });
 
-    const borrows = await borrowsCollection.find({
-      borrowerEmail: user.email.trim().toLowerCase(),
-    }).sort({ borrowDate: -1 }).toArray();
+    const borrows = await borrowsCollection.find({ borrowerEmail: email })
+      .sort({ borrowDate: -1 }).toArray();
 
     const now = new Date();
 
@@ -362,8 +362,7 @@ app.get("/my-borrows", async (req, res) => {
         ...borrow,
         borrowDate,
         returnDate,
-        overdue: borrow.status === "borrowed" &&
-          returnDate && new Date(returnDate) < now,
+        overdue: borrow.status === "borrowed" && returnDate && new Date(returnDate) < now,
       };
     }));
   } catch (error) {
@@ -379,20 +378,16 @@ app.patch("/return/:id", async (req, res) => {
     if (!user) return res.status(401).send({ message: "Please login first" });
 
     const { id } = req.params;
-    if (!ObjectId.isValid(id)) {
-      return res.status(400).send({ message: "Invalid borrow ID" });
-    }
-
-    const email = user.email.trim().toLowerCase();
+    if (!ObjectId.isValid(id)) return res.status(400).send({ message: "Invalid borrow ID" });
 
     const borrow = await borrowsCollection.findOneAndUpdate(
       {
         _id: new ObjectId(id),
-        borrowerEmail: email,
+        borrowerEmail: getEmail(user),
         status: "borrowed",
       },
       { $set: { status: "returned", returnedAt: new Date() } },
-      { returnDocument: "after" },
+      { returnDocument: "after" }
     );
 
     if (!borrow) {
@@ -401,7 +396,7 @@ app.patch("/return/:id", async (req, res) => {
 
     const bookUpdate = await booksCollection.updateOne(
       { _id: borrow.bookId },
-      { $inc: { availableCopies: 1 } },
+      { $inc: { availableCopies: 1 } }
     );
 
     if (!bookUpdate.matchedCount) {
@@ -415,14 +410,9 @@ app.patch("/return/:id", async (req, res) => {
   }
 });
 
-// Multer errors
+// Error handler
 app.use((error, req, res, next) => {
-  if (error instanceof multer.MulterError || error) {
-    return res.status(400).send({
-      message: error.message || "Something went wrong",
-    });
-  }
-  next();
+  res.status(400).send({ message: error.message || "Something went wrong" });
 });
 
 app.listen(PORT, () => {
